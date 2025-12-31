@@ -88,7 +88,7 @@ Use the **demo-business** template to create a single-person language-services w
 ### 7) Contact form that emails Ivana
 Because FTP/static hosting won’t send email from pure HTML/JS, implement the form using **one** of these approaches:
 
-- **Option A (recommended on typical shared hosting): PHP mail handler**
+- **Option A (recommended on typical shared hosting): PHP mail handler** (confirmed: hosting supports PHP 8.3.25 with mail extensions)
    - Add `public_html/contact.php` (server-side) that validates fields, applies basic spam protection, and sends mail to a configured recipient.
    - Frontend posts the form to `/contact.php` and shows success/error messages.
    - Use placeholders for recipient email until you confirm it.
