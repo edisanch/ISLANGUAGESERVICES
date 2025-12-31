@@ -41,6 +41,51 @@ Note: this is optional for the deployed site. The deployed site lives in `public
 
 Upload the **contents** of `public_html/` to the remote `public_html/` directory on your hosting.
 
+### Automated FTP deploy (recommended)
+
+This repo includes a small script that deploys `./public_html` to your FTP hosting using `lftp`:
+
+```bash
+./upload_deploy --help
+```
+
+Install dependency (Ubuntu/Debian):
+
+```bash
+sudo apt-get update
+sudo apt-get install -y lftp
+```
+
+Required environment variables:
+
+- `FTP_HOST` (example: `wheat-worm-785534.hostingersite.com`)
+- `FTP_USER`
+- `FTP_PASS`
+
+Optional environment variables:
+
+- `FTP_REMOTE_PATH` (default: `public_html`)
+
+Examples:
+
+- Dry run (shows what would change):
+
+```bash
+FTP_HOST=... FTP_USER=... FTP_PASS=... ./upload_deploy --dry-run
+```
+
+- Normal deploy (uploads changed/newer files only):
+
+```bash
+FTP_HOST=... FTP_USER=... FTP_PASS=... ./upload_deploy
+```
+
+- Full sync (also deletes remote files not present locally):
+
+```bash
+FTP_HOST=... FTP_USER=... FTP_PASS=... ./upload_deploy --delete
+```
+
 Important:
 - Do **not** commit or publish FTP credentials.
 - Keep `ftp info.txt` out of version control (recommended: add it to `.gitignore`).

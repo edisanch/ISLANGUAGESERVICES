@@ -1,0 +1,299 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Deploy local ./public_html to FTP/SFTP/rsync-ssh.
+#
+# Usage:
+#   ./upload_deploy [--dry-run] [--delete] [--yes] [--debug] [--ftps] [--sftp] [--rsync-ssh] [--port=NNN]
+#
+# Required env vars:
+#   FTP_HOST   (e.g. wheat-worm-785534.hostingersite.com)
+#   FTP_USER
+#   FTP_PASS   (for FTP/SFTP; for rsync-ssh, use SSH key or set SSH_PASS)
+# Optional env vars:
+#   FTP_REMOTE_PATH (default: auto-detect for FTP/SFTP; required for rsync-ssh)
+#   FTP_DOMAIN      (optional; used for Hostinger-style paths when FTP_HOST is not the domain)
+#   FTP_TIMEOUT_SEC (default: 60) overall timeout per lftp invocation
+#   FTP_FTPS        (set to 1 to force explicit TLS)
+#   DEPLOY_PROTOCOL (ftp|ftps|sftp|rsync-ssh; default: ftp)
+#   DEPLOY_PORT     (optional; custom port, e.g. Hostinger SFTP/SSH is often 65002)
+#   SSH_PASS        (optional; for rsync-ssh if not using SSH key)
+#
+# Examples:
+#   FTP_HOST=example.com FTP_USER=u123 FTP_PASS=secret ./upload_deploy
+#   FTP_HOST=example.com FTP_USER=u123 FTP_PASS=secret ./upload_deploy --dry-run
+#   FTP_HOST=example.com FTP_USER=u123 FTP_PASS=secret ./upload_deploy --delete
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOCAL_DIR="$SCRIPT_DIR/public_html"
+
+DRY_RUN=0
+DELETE_REMOTE=0
+ASSUME_YES=0
+DEBUG=0
+USE_FTPS=0
+DEPLOY_PROTOCOL="${DEPLOY_PROTOCOL:-ftp}"
+DEPLOY_PORT="${DEPLOY_PORT:-}"
+
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) DRY_RUN=1 ;;
+    --delete) DELETE_REMOTE=1 ;;
+    --yes) ASSUME_YES=1 ;;
+    --debug) DEBUG=1 ;;
+    --ftps) USE_FTPS=1 ;;
+    --sftp) DEPLOY_PROTOCOL="sftp" ;;
+    --rsync-ssh) DEPLOY_PROTOCOL="rsync-ssh" ;;
+    --port=*) DEPLOY_PORT="${arg#--port=}" ;;
+    -h|--help)
+      sed -n '1,120p' "$0"
+      exit 0
+      ;;
+    *)
+      echo "Unknown arg: $arg" >&2
+      echo "Run: ./upload_deploy --help" >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ ! -d "$LOCAL_DIR" ]]; then
+  echo "Missing local directory: $LOCAL_DIR" >&2
+  exit 1
+fi
+
+: "${FTP_HOST:?FTP_HOST is required}"
+: "${FTP_USER:?FTP_USER is required}"
+if [[ "$DEPLOY_PROTOCOL" != "rsync-ssh" ]]; then
+  : "${FTP_PASS:?FTP_PASS is required}"
+fi
+FTP_REMOTE_PATH="${FTP_REMOTE_PATH:-}"
+FTP_DOMAIN="${FTP_DOMAIN:-}"
+FTP_TIMEOUT_SEC="${FTP_TIMEOUT_SEC:-60}"
+if [[ "${FTP_FTPS:-0}" == "1" ]]; then
+  USE_FTPS=1
+fi
+
+if [[ -n "$DEPLOY_PORT" && ! "$DEPLOY_PORT" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: DEPLOY_PORT must be a number (got: $DEPLOY_PORT)" >&2
+  exit 2
+fi
+
+if [[ $USE_FTPS -eq 1 && "$DEPLOY_PROTOCOL" == "ftp" ]]; then
+  DEPLOY_PROTOCOL="ftps"
+fi
+
+case "$DEPLOY_PROTOCOL" in
+  ftp|ftps|sftp|rsync-ssh) ;;
+  *)
+    echo "ERROR: DEPLOY_PROTOCOL must be one of: ftp, ftps, sftp, rsync-ssh" >&2
+    exit 2
+    ;;
+esac
+
+if ! command -v lftp >/dev/null 2>&1; then
+  echo "lftp is required but not installed." >&2
+  echo "Install it, e.g.: sudo apt-get update && sudo apt-get install -y lftp" >&2
+  exit 1
+fi
+
+REMOTE_URL="$DEPLOY_PROTOCOL://$FTP_HOST"
+if [[ -n "$DEPLOY_PORT" ]]; then
+  REMOTE_URL+="${DEPLOY_PORT:+:$DEPLOY_PORT}"
+fi
+if [[ "$DEPLOY_PROTOCOL" == "rsync-ssh" ]]; then
+  REMOTE_URL="$FTP_USER@$FTP_HOST:$FTP_REMOTE_PATH"
+  if [[ -n "$DEPLOY_PORT" ]]; then
+    REMOTE_URL+=" (port $DEPLOY_PORT)"
+  fi
+fi
+echo "Local:  $LOCAL_DIR"
+echo "Remote: $REMOTE_URL"
+echo "Mode:   upload changed files only"$( [[ $DELETE_REMOTE -eq 1 ]] && echo " + delete remote extras" )$( [[ $DRY_RUN -eq 1 ]] && echo " (dry-run)" )
+if [[ "$DEPLOY_PROTOCOL" == "ftps" ]]; then
+  echo "Protocol: ftps (explicit TLS)" >&2
+fi
+if [[ "$DEPLOY_PROTOCOL" == "sftp" ]]; then
+  echo "Protocol: sftp (SSH File Transfer Protocol)" >&2
+fi
+if [[ "$DEPLOY_PROTOCOL" == "rsync-ssh" ]]; then
+  echo "Protocol: rsync over SSH" >&2
+fi
+
+if [[ $DELETE_REMOTE -eq 1 && $ASSUME_YES -ne 1 ]]; then
+  echo
+  echo "WARNING: --delete will remove remote files not present locally."
+  read -r -p "Continue? [y/N] " ans
+  case "${ans,,}" in
+    y|yes) ;;
+    *)
+      echo "Aborted."
+      exit 1
+      ;;
+  esac
+fi
+
+MIRROR_FLAGS=(
+  "--reverse"
+  "--verbose"
+  "--only-newer"
+  "--ignore-time"
+  "--parallel=2"
+)
+
+LFTP_DEBUG_E=""
+LFTP_DEBUG_H=""
+if [[ $DEBUG -eq 1 ]]; then
+  echo "Debug:  enabled (lftp cmd:trace + debug)" >&2
+  LFTP_DEBUG_E='set cmd:trace yes; debug -t -p -c 3;'
+  LFTP_DEBUG_H=$'set cmd:trace yes\ndebug -t -p -c 3'
+fi
+
+LFTP_TLS_E=""
+LFTP_TLS_H=""
+if [[ "$DEPLOY_PROTOCOL" == "ftps" ]]; then
+  LFTP_TLS_E='set ftp:ssl-allow yes; set ftp:ssl-force true; set ftp:ssl-protect-data true; set ssl:verify-certificate no;'
+  LFTP_TLS_H=$'set ftp:ssl-allow yes\nset ftp:ssl-force true\nset ftp:ssl-protect-data true\nset ssl:verify-certificate no'
+fi
+
+LFTP_SFTP_E=""
+LFTP_SFTP_H=""
+if [[ "$DEPLOY_PROTOCOL" == "sftp" ]]; then
+  LFTP_SFTP_E='set sftp:auto-confirm yes;'
+  LFTP_SFTP_H=$'set sftp:auto-confirm yes'
+fi
+
+run_lftp() {
+  if command -v timeout >/dev/null 2>&1; then
+    timeout --preserve-status "${FTP_TIMEOUT_SEC}s" lftp "$@"
+  else
+    lftp "$@"
+  fi
+}
+
+detect_remote_path() {
+  local -a candidates=()
+  local domain
+
+  if [[ -n "$FTP_REMOTE_PATH" ]]; then
+    candidates+=("$FTP_REMOTE_PATH")
+  else
+    candidates+=("public_html")
+
+    domain="$FTP_DOMAIN"
+    if [[ -z "$domain" ]]; then
+      domain="$FTP_HOST"
+    fi
+    candidates+=("domains/$domain/public_html")
+  fi
+
+  local candidate
+  for candidate in "${candidates[@]}"; do
+    if [[ $DEBUG -eq 1 ]]; then
+      echo "Detect: trying remote path: $candidate" >&2
+      if run_lftp -u "$FTP_USER","$FTP_PASS" "$REMOTE_URL" -e "set cmd:fail-exit yes; set net:max-retries 1; set net:timeout 15; set ftp:passive-mode true; $LFTP_SFTP_E $LFTP_TLS_E $LFTP_DEBUG_E cd \"$candidate\"; bye" 1>&2; then
+        echo "$candidate"
+        return 0
+      else
+        rc=$?
+        echo "Detect: failed for $candidate (exit $rc)" >&2
+      fi
+    else
+      if run_lftp -u "$FTP_USER","$FTP_PASS" "$REMOTE_URL" -e "set cmd:fail-exit yes; set net:max-retries 1; set net:timeout 15; set ftp:passive-mode true; $LFTP_SFTP_E $LFTP_TLS_E cd \"$candidate\"; bye" >/dev/null 2>&1; then
+        echo "$candidate"
+        return 0
+      fi
+    fi
+  done
+
+  echo "" 
+  return 1
+}
+
+if [[ "$DEPLOY_PROTOCOL" == "rsync-ssh" ]]; then
+  if [[ -z "$FTP_REMOTE_PATH" ]]; then
+    echo "ERROR: FTP_REMOTE_PATH is required for rsync-ssh" >&2
+    exit 1
+  fi
+  REMOTE_PATH="$FTP_REMOTE_PATH"
+  echo "Remote path: $REMOTE_PATH"
+else
+  REMOTE_PATH="$(detect_remote_path)" || true
+  if [[ -z "$REMOTE_PATH" ]]; then
+    echo "ERROR: Could not cd to a remote web root via FTP." >&2
+    if command -v timeout >/dev/null 2>&1; then
+      echo "Note: if this is hanging/timeout, your network may be blocking the protocol/port." >&2
+    fi
+    echo "Tried: ${FTP_REMOTE_PATH:-public_html} and Hostinger-style domains/<domain>/public_html" >&2
+    echo "Set FTP_REMOTE_PATH explicitly, e.g.:" >&2
+    echo "  FTP_REMOTE_PATH=domains/<your-domain>/public_html" >&2
+    echo "If FTP (port 21) is blocked, try SFTP:" >&2
+    echo "  DEPLOY_PROTOCOL=sftp ./upload_deploy --dry-run --debug" >&2
+    echo "Or rsync over SSH:" >&2
+    echo "  DEPLOY_PROTOCOL=rsync-ssh FTP_REMOTE_PATH=domains/<your-domain>/public_html ./upload_deploy --dry-run" >&2
+    exit 1
+  fi
+
+  echo "Remote path: $REMOTE_PATH"
+fi
+
+# Delete remote files that are not present locally (optional)
+if [[ $DELETE_REMOTE -eq 1 ]]; then
+  MIRROR_FLAGS+=("--delete")
+fi
+
+# Dry run (optional)
+if [[ $DRY_RUN -eq 1 ]]; then
+  MIRROR_FLAGS+=("--dry-run")
+fi
+
+if [[ "$DEPLOY_PROTOCOL" == "rsync-ssh" ]]; then
+  RSYNC_CMD=(rsync -avz)
+  if [[ $DRY_RUN -eq 1 ]]; then
+    RSYNC_CMD+=(--dry-run)
+  fi
+  if [[ $DELETE_REMOTE -eq 1 ]]; then
+    RSYNC_CMD+=(--delete)
+  fi
+  SSH_OPTS=()
+  if [[ -n "$DEPLOY_PORT" ]]; then
+    SSH_OPTS+=(-p "$DEPLOY_PORT")
+  fi
+  if [[ -n "${SSH_PASS:-}" ]]; then
+    if command -v sshpass >/dev/null 2>&1; then
+      RSYNC_CMD=(sshpass -p "$SSH_PASS" "${RSYNC_CMD[@]}")
+    else
+      echo "ERROR: SSH_PASS set but sshpass not installed. Install sshpass or use SSH key." >&2
+      exit 1
+    fi
+  fi
+  if [[ ${#SSH_OPTS[@]} -gt 0 ]]; then
+    RSYNC_CMD+=(-e "ssh ${SSH_OPTS[*]}")
+  fi
+  RSYNC_CMD+=("$LOCAL_DIR/" "$FTP_USER@$FTP_HOST:$REMOTE_PATH/")
+  echo "Running: ${RSYNC_CMD[*]}"
+  "${RSYNC_CMD[@]}"
+else
+  # Note: We avoid printing the password. lftp receives it via variables.
+  # The 'set ssl:verify-certificate no' is sometimes needed on shared hosts;
+  # we keep it enabled only for plain FTP by not forcing FTPS.
+
+  run_lftp -u "$FTP_USER","$FTP_PASS" "$REMOTE_URL" <<LFTP
+set cmd:fail-exit yes
+set net:max-retries 2
+set net:timeout 20
+set ftp:passive-mode true
+$LFTP_SFTP_H
+$LFTP_TLS_H
+$LFTP_DEBUG_H
+
+cd "$REMOTE_PATH" || exit 1
+
+
+mirror ${MIRROR_FLAGS[*]} "$LOCAL_DIR" .
+
+bye
+LFTP
+fi
+
+echo "Done."
