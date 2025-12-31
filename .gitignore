@@ -1,0 +1,9 @@
+# Local secrets / credentials
+ftp info.txt
+
+# OS / editor
+.DS_Store
+.vscode/
+
+# Node (template tooling)
+node_modules/
